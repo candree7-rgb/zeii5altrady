@@ -4,15 +4,15 @@
 """
 Discord → Altrady Signal-Forwarder
 - Holt immer nur die NEUESTE Nachricht aus einem Discord-Channel
-- Extrahiert den ERSTEN Signal-Block (BUY/SELL) aus der Message (Header/Timeframe egal)
+- Extrahiert den ERSTEN Signal-Block (BUY/SELL) aus der Message
 - Parst: BUY/SELL, on BASE/QUOTE, Price, TP1, TP2, SL
 - Mappings: LUNA→LUNA2, SHIB→1000SHIB, USD→USDT
-- Tick-Rundung nach deiner Tickmap
+- Tick-Rundung (Tickmap)
 - Leverage: floor(SAFETY_PCT / SL%), gecappt mit MAX_LEVERAGE
-- Baut exakt das gewünschte Altrady-JSON
-- Postet direkt an deinen Altrady-Signal-Webhook (ohne Zapier)
+- Buildet das Altrady-JSON und postet direkt an deinen Altrady-Signal-Webhook
 
-ENV-Variablen siehe .env.example
+Neu:
+- TP_SPLITS="20,80" aus ENV (genau 2 Werte, Summe 100; sonst Fallback 20/80)
 """
 
 import os
@@ -49,6 +49,12 @@ QUOTE              = os.getenv("QUOTE", "USDT").strip().upper()
 MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "75"))
 SAFETY_PCT   = float(os.getenv("SAFETY_PCT", "80"))  # floor(SAFETY_PCT / SL%)
 
+# TP-Splits (immer genau 2 TPs)
+TP_SPLITS_RAW = os.getenv("TP_SPLITS", "20,80").strip()
+
+# Entry-Expiration (Minuten) – optional via ENV einstellbar
+ENTRY_EXPIRATION_MIN = int(os.getenv("ENTRY_EXPIRATION_MIN", "15"))
+
 # Polling (alle X Sekunden, jeweils +Offset)
 POLL_BASE   = int(os.getenv("POLL_BASE_SECONDS", "60"))   # default 60s
 POLL_OFFSET = int(os.getenv("POLL_OFFSET_SECONDS", "3"))  # z.B. :03, :63, ...
@@ -61,9 +67,32 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
     sys.exit(1)
 
 HEADERS = {
-    "Authorization": DISCORD_TOKEN,  # ENV MUSS jetzt 'Bot xyz' ODER 'Bearer xyz' sein
+    # Achtung: Bei User-Session muss hier der komplette Authorization-Wert stehen (z. B. nur der Token).
+    # Du hast bereits angepasst, daher übernehmen wir exakt den ENV-Inhalt:
+    "Authorization": DISCORD_TOKEN,
     "User-Agent": "DiscordToAltrady/1.0"
 }
+
+def parse_tp_splits(raw: str) -> tuple[int, int]:
+    """
+    Erwartet zwei Zahlen durch Komma getrennt. Summe muss 100 sein.
+    Fallback: (20, 80)
+    """
+    try:
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) != 2:
+            raise ValueError("Genau 2 Werte benötigt.")
+        a, b = int(float(parts[0])), int(float(parts[1]))  # erlaubt "20", "20.0"
+        if a <= 0 or b <= 0 or a > 100 or b > 100:
+            raise ValueError("Werte müssen 1..100 sein.")
+        if a + b != 100:
+            raise ValueError("Summe ungleich 100.")
+        return a, b
+    except Exception:
+        print(f"[WARN] Ungültige TP_SPLITS='{raw}', verwende Fallback 20,80.")
+        return 20, 80
+
+TP1_PCT, TP2_PCT = parse_tp_splits(TP_SPLITS_RAW)
 
 # =========================
 # Utils: State + Timing
@@ -114,16 +143,12 @@ def fetch_latest_message(channel_id: str):
     return data[0] if data else None  # neueste zuerst
 
 # =========================
-# Text-Extraktion: nur ERSTEN Signal-Block (BUY/SELL … bis vor nächstes Signal)
+# Text-Extraktion: nur ERSTEN Signal-Block
 # =========================
 
 def extract_text_from_msg(msg: dict) -> str:
     """
-    Zieht aus der Discord-Message genau den ersten Signal-Block heraus:
-    - ignoriert Header wie '🎯 Trading Signals 🎯'
-    - beginnt bei der ersten Zeile mit BUY/SELL
-    - endet vor dem nächsten BUY/SELL-Block ODER vor einer Leerzeile (2+ \n)
-    - entfernt 'Timeframe:'-Zeilen
+    Erster BUY/SELL-Block (ignoriert Header/Timeframe, stoppt vor nächstem Block oder Leerzeile).
     """
     def first_block_source() -> str:
         content = (msg.get("content") or "").strip()
@@ -139,7 +164,6 @@ def extract_text_from_msg(msg: dict) -> str:
     if not raw:
         return ""
 
-    # Start bei erster BUY/SELL-Zeile
     m_start = re.search(r"(?im)^\s*.*\b(BUY|SELL)\b.*$", raw)
     if not m_start:
         return ""
@@ -147,7 +171,6 @@ def extract_text_from_msg(msg: dict) -> str:
     start_idx = m_start.start()
     tail = raw[start_idx:]
 
-    # Vor nächstem BUY/SELL (am Zeilenanfang irgendwo später) kappen
     m_next = re.search(r"(?im)^\s*.*\b(BUY|SELL)\b.*$", tail[len(m_start.group(0)) + 1:])
     if m_next:
         end_idx = len(m_start.group(0)) + 1 + m_next.start()
@@ -155,12 +178,10 @@ def extract_text_from_msg(msg: dict) -> str:
     else:
         block = tail
 
-    # Falls vorher 2+ Newlines auftauchen, dort kappen
     m_blank = re.search(r"\n\s*\n", block)
     if m_blank:
         block = block[:m_blank.start()]
 
-    # 'Timeframe:'-Zeilen komplett entfernen
     block = re.sub(r"(?im)^\s*Timeframe:.*$", "", block).strip()
     return block
 
@@ -207,7 +228,6 @@ def parse_signal_text(text: str) -> dict:
     if quoted == "USD":
         quoted = "USDT"
 
-    # Spezielle Mappings
     if base == "LUNA":
         base = "LUNA2"
     if base == "SHIB":
@@ -218,13 +238,11 @@ def parse_signal_text(text: str) -> dict:
     tp2   = float(m_tp2.group(1))
     sl    = float(m_sl.group(1))
 
-    # Plausibilität
     if side == "long" and not (sl < entry and tp1 > entry and tp2 > entry):
         raise ValueError("Long: TP/SL liegen nicht plausibel zum Entry.")
     if side == "short" and not (sl > entry and tp1 < entry and tp2 < entry):
         raise ValueError("Short: TP/SL liegen nicht plausibel zum Entry.")
 
-    # SL-% & dynamische Leverage
     sl_pct = ((entry - sl) / entry * 100.0) if side == "long" else ((sl - entry) / entry * 100.0)
     lev = int(SAFETY_PCT // max(sl_pct, 1e-12))
     if lev < 1:
@@ -232,10 +250,8 @@ def parse_signal_text(text: str) -> dict:
     if lev > MAX_LEVERAGE:
         lev = MAX_LEVERAGE
 
-    # Symbol-Format für Altrady: EXCHANGE_QUOTE_BASE
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
 
-    # Tick-Rundung
     entry = round_tick(base, entry)
     tp1   = round_tick(base, tp1)
     tp2   = round_tick(base, tp2)
@@ -244,7 +260,7 @@ def parse_signal_text(text: str) -> dict:
     return {
         "side": side,
         "base": base,
-        "quote_from_signal": quoted,  # nur informativ
+        "quote_from_signal": quoted,
         "entry": entry,
         "tp1": tp1,
         "tp2": tp2,
@@ -255,29 +271,12 @@ def parse_signal_text(text: str) -> dict:
     }
 
 # =========================
-# Payload für Altrady (EXAKTES Format)
+# Payload für Altrady
 # =========================
 
 def build_altrady_payload(parsed: dict) -> dict:
     """
-    Baut exakt das gewünschte JSON:
-    {
-      "api_key": "...",
-      "api_secret": "...",
-      "exchange": "BIFU",
-      "action": "open",
-      "symbol": "...",
-      "side": "long",
-      "order_type": "limit",
-      "signal_price": <entry>,
-      "leverage": <lev>,
-      "take_profit": [
-        {"price": <tp1>, "position_percentage": 20},
-        {"price": <tp2>, "position_percentage": 80}
-      ],
-      "stop_loss": {"stop_price": <sl>, "protection_type": "BREAK_EVEN"},
-      "entry_expiration": {"time": 15}
-    }
+    JSON exakt nach Wunsch, aber TP-Splits aus ENV (TP_SPLITS="x,y", Summe 100).
     """
     return {
         "api_key": ALTRADY_API_KEY,
@@ -285,19 +284,19 @@ def build_altrady_payload(parsed: dict) -> dict:
         "exchange": ALTRADY_EXCHANGE,
         "action": "open",
         "symbol": parsed["symbol"],
-        "side": parsed["side"],                 # "long" | "short"
+        "side": parsed["side"],
         "order_type": "limit",
-        "signal_price": parsed["entry"],        # Limit-Entry aus Signal
-        "leverage": parsed["leverage"],         # dynamisch berechnet
+        "signal_price": parsed["entry"],
+        "leverage": parsed["leverage"],
         "take_profit": [
-            {"price": parsed["tp1"], "position_percentage": 20},
-            {"price": parsed["tp2"], "position_percentage": 80}
+            {"price": parsed["tp1"], "position_percentage": TP1_PCT},
+            {"price": parsed["tp2"], "position_percentage": TP2_PCT}
         ],
         "stop_loss": {
             "stop_price": parsed["sl"],
             "protection_type": "BREAK_EVEN"
         },
-        "entry_expiration": {"time": 15}
+        "entry_expiration": {"time": ENTRY_EXPIRATION_MIN}
     }
 
 # =========================
@@ -305,7 +304,6 @@ def build_altrady_payload(parsed: dict) -> dict:
 # =========================
 
 def post_to_altrady(payload: dict):
-    # robuste, kleine Retry-Schleife
     for attempt in range(3):
         try:
             r = requests.post(ALTRADY_WEBHOOK_URL, json=payload, timeout=20)
@@ -319,7 +317,7 @@ def post_to_altrady(payload: dict):
                 continue
             r.raise_for_status()
             return r
-        except Exception as ex:
+        except Exception:
             if attempt == 2:
                 raise
             time.sleep(1.5 * (attempt + 1))
@@ -329,8 +327,8 @@ def post_to_altrady(payload: dict):
 # =========================
 
 def main():
-    print(f"Getaktet: alle {POLL_BASE}s, jeweils +{POLL_OFFSET}s Offset (z. B. 10:00:{POLL_OFFSET:02d})")
-    print(f"➡️ Exchange: {ALTRADY_EXCHANGE} | Quote: {QUOTE} | MaxLev: {MAX_LEVERAGE} | Safety%: {SAFETY_PCT}")
+    print(f"Getaktet: alle {POLL_BASE}s, jeweils +{POLL_OFFSET}s Offset")
+    print(f"➡️ Exchange: {ALTRADY_EXCHANGE} | Quote: {QUOTE} | MaxLev: {MAX_LEVERAGE} | Safety%: {SAFETY_PCT} | TP_SPLITS: {TP1_PCT}/{TP2_PCT} | Exp: {ENTRY_EXPIRATION_MIN}m")
     state = load_state()
     last_id = state.get("last_id")
 
@@ -344,16 +342,15 @@ def main():
                     if not raw_text:
                         print("[skip] leere/irrelevante Nachricht.")
                     else:
-                        # Debug (kürzen, damit Log lesbar bleibt)
                         dbg = re.sub(r"\s+", " ", raw_text)[:120]
                         print(f"[DBG] Erster Block: {dbg!r}")
 
                         parsed = parse_signal_text(raw_text)
                         payload = build_altrady_payload(parsed)
-                        res = post_to_altrady(payload)
+                        _ = post_to_altrady(payload)
 
                         ts = datetime.now().strftime("%H:%M:%S")
-                        print(f"[{ts}] ✅ gesendet | {parsed['symbol']} | {parsed['side']} | entry={parsed['entry']} | lev={parsed['leverage']}")
+                        print(f"[{ts}] ✅ gesendet | {parsed['symbol']} | {parsed['side']} | entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}")
                         last_id = mid
                         state["last_id"] = last_id
                         save_state(state)
@@ -375,7 +372,6 @@ def main():
                 pass
             print("[HTTP ERROR]", http_err.response.status_code, body or "")
         except AssertionError as aex:
-            # Parser-Fehler (fehlende Felder etc.)
             print("[PARSE ERROR]", str(aex))
         except Exception:
             print("[ERROR]")
