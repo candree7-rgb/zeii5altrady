@@ -9,10 +9,12 @@ Discord → Altrady Signal-Forwarder
 - Mappings: LUNA→LUNA2, SHIB→1000SHIB, USD→USDT
 - Tick-Rundung (Tickmap)
 - Leverage: floor(SAFETY_PCT / SL%), gecappt mit MAX_LEVERAGE
+- Coin-spezifische Leverage-Caps (z. B. LUNA/LUNA2 = 50x)
 - Buildet das Altrady-JSON und postet direkt an deinen Altrady-Signal-Webhook
 
 Neu:
 - TP_SPLITS="20,80" aus ENV (genau 2 Werte, Summe 100; sonst Fallback 20/80)
+- Coin-Lev-Caps via ENV: z. B. LEV_MAX_LUNA2=50
 """
 
 import os
@@ -49,6 +51,13 @@ QUOTE              = os.getenv("QUOTE", "USDT").strip().upper()
 MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "75"))
 SAFETY_PCT   = float(os.getenv("SAFETY_PCT", "80"))  # floor(SAFETY_PCT / SL%)
 
+# Coin-spezifische Leverage-Caps (Defaults: LUNA/LUNA2 = 50x; per ENV überschreibbar)
+COIN_LEV_CAPS = {
+    "LUNA2": int(os.getenv("LEV_MAX_LUNA2", "50")),
+    "LUNA":  int(os.getenv("LEV_MAX_LUNA",  "50")),  # falls mal vor Mapping geprüft wird
+    # hier kannst du leicht erweitern: "SHIB": int(os.getenv("LEV_MAX_SHIB", "75")),
+}
+
 # TP-Splits (immer genau 2 TPs)
 TP_SPLITS_RAW = os.getenv("TP_SPLITS", "20,80").strip()
 
@@ -67,8 +76,7 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
     sys.exit(1)
 
 HEADERS = {
-    # Achtung: Bei User-Session muss hier der komplette Authorization-Wert stehen (z. B. nur der Token).
-    # Du hast bereits angepasst, daher übernehmen wir exakt den ENV-Inhalt:
+    # Bei User-Session: hier muss der komplette Authorization-Wert stehen (du hast das schon so gesetzt).
     "Authorization": DISCORD_TOKEN,
     "User-Agent": "DiscordToAltrady/1.0"
 }
@@ -228,6 +236,7 @@ def parse_signal_text(text: str) -> dict:
     if quoted == "USD":
         quoted = "USDT"
 
+    # Mapping vor Caps (damit LUNA→LUNA2 greift)
     if base == "LUNA":
         base = "LUNA2"
     if base == "SHIB":
@@ -238,11 +247,13 @@ def parse_signal_text(text: str) -> dict:
     tp2   = float(m_tp2.group(1))
     sl    = float(m_sl.group(1))
 
+    # Plausibilität
     if side == "long" and not (sl < entry and tp1 > entry and tp2 > entry):
         raise ValueError("Long: TP/SL liegen nicht plausibel zum Entry.")
     if side == "short" and not (sl > entry and tp1 < entry and tp2 < entry):
         raise ValueError("Short: TP/SL liegen nicht plausibel zum Entry.")
 
+    # SL-% & dynamische Leverage
     sl_pct = ((entry - sl) / entry * 100.0) if side == "long" else ((sl - entry) / entry * 100.0)
     lev = int(SAFETY_PCT // max(sl_pct, 1e-12))
     if lev < 1:
@@ -250,8 +261,15 @@ def parse_signal_text(text: str) -> dict:
     if lev > MAX_LEVERAGE:
         lev = MAX_LEVERAGE
 
+    # Coin-spezifischen Cap anwenden (z. B. LUNA2=50)
+    coin_cap = COIN_LEV_CAPS.get(base)
+    if coin_cap is not None and lev > coin_cap:
+        lev = coin_cap
+
+    # Symbol-Format für Altrady: EXCHANGE_QUOTE_BASE
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
 
+    # Tick-Rundung
     entry = round_tick(base, entry)
     tp1   = round_tick(base, tp1)
     tp2   = round_tick(base, tp2)
@@ -328,7 +346,12 @@ def post_to_altrady(payload: dict):
 
 def main():
     print(f"Getaktet: alle {POLL_BASE}s, jeweils +{POLL_OFFSET}s Offset")
-    print(f"➡️ Exchange: {ALTRADY_EXCHANGE} | Quote: {QUOTE} | MaxLev: {MAX_LEVERAGE} | Safety%: {SAFETY_PCT} | TP_SPLITS: {TP1_PCT}/{TP2_PCT} | Exp: {ENTRY_EXPIRATION_MIN}m")
+    print(
+        "➡️ Exchange: {ex} | Quote: {q} | MaxLev: {gcap} | Safety%: {s} | TP%: {t1}/{t2} | Exp: {exp}m | CoinCaps: {caps}".format(
+            ex=ALTRADY_EXCHANGE, q=QUOTE, gcap=MAX_LEVERAGE, s=SAFETY_PCT,
+            t1=TP1_PCT, t2=TP2_PCT, exp=ENTRY_EXPIRATION_MIN, caps=COIN_LEV_CAPS
+        )
+    )
     state = load_state()
     last_id = state.get("last_id")
 
@@ -350,7 +373,10 @@ def main():
                         _ = post_to_altrady(payload)
 
                         ts = datetime.now().strftime("%H:%M:%S")
-                        print(f"[{ts}] ✅ gesendet | {parsed['symbol']} | {parsed['side']} | entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}")
+                        print(
+                            f"[{ts}] ✅ gesendet | {parsed['symbol']} | {parsed['side']} | "
+                            f"entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}"
+                        )
                         last_id = mid
                         state["last_id"] = last_id
                         save_state(state)
