@@ -61,11 +61,7 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
     sys.exit(1)
 
 HEADERS = {
-    # Discord erwartet i.d.R. 'Bot <token>'. Wenn bereits 'Bot ' oder 'Bearer ' enthalten, nicht doppeln.
-    "Authorization": (
-        DISCORD_TOKEN if DISCORD_TOKEN.startswith(("Bot ", "Bearer "))
-        else f"Bot {DISCORD_TOKEN}"
-    ),
+    "Authorization": DISCORD_TOKEN,  # ENV MUSS jetzt 'Bot xyz' ODER 'Bearer xyz' sein
     "User-Agent": "DiscordToAltrady/1.0"
 }
 
