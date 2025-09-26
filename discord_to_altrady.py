@@ -10,6 +10,7 @@ Discord → Altrady Signal-Forwarder
 - Tick-Rundung (Tickmap)
 - Leverage: floor(SAFETY_PCT / SL%), gecappt mit MAX_LEVERAGE
 - Coin-spezifische Leverage-Caps (z. B. LUNA/LUNA2 = 50x)
+- **NEU**: Nur USD/USDT-Quotes werden gehandelt; alles andere (z. B. */BTC) wird sauber übersprungen.
 - Buildet das Altrady-JSON und postet direkt an deinen Altrady-Signal-Webhook
 
 Neu:
@@ -54,19 +55,18 @@ SAFETY_PCT   = float(os.getenv("SAFETY_PCT", "80"))  # floor(SAFETY_PCT / SL%)
 # Coin-spezifische Leverage-Caps (Defaults: LUNA/LUNA2 = 50x; per ENV überschreibbar)
 COIN_LEV_CAPS = {
     "LUNA2": int(os.getenv("LEV_MAX_LUNA2", "50")),
-    "LUNA":  int(os.getenv("LEV_MAX_LUNA",  "50")),  # falls mal vor Mapping geprüft wird
-    # hier kannst du leicht erweitern: "SHIB": int(os.getenv("LEV_MAX_SHIB", "75")),
+    "LUNA":  int(os.getenv("LEV_MAX_LUNA",  "50")),
 }
 
 # TP-Splits (immer genau 2 TPs)
 TP_SPLITS_RAW = os.getenv("TP_SPLITS", "20,80").strip()
 
-# Entry-Expiration (Minuten) – optional via ENV einstellbar
+# Entry-Expiration (Minuten)
 ENTRY_EXPIRATION_MIN = int(os.getenv("ENTRY_EXPIRATION_MIN", "15"))
 
 # Polling (alle X Sekunden, jeweils +Offset)
-POLL_BASE   = int(os.getenv("POLL_BASE_SECONDS", "60"))   # default 60s
-POLL_OFFSET = int(os.getenv("POLL_OFFSET_SECONDS", "3"))  # z.B. :03, :63, ...
+POLL_BASE   = int(os.getenv("POLL_BASE_SECONDS", "60"))
+POLL_OFFSET = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
 
 STATE_FILE  = Path(os.getenv("STATE_FILE", "state.json"))
 
@@ -76,25 +76,25 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
     sys.exit(1)
 
 HEADERS = {
-    # Bei User-Session: hier muss der komplette Authorization-Wert stehen (du hast das schon so gesetzt).
-    "Authorization": DISCORD_TOKEN,
-    "User-Agent": "DiscordToAltrady/1.0"
+    "Authorization": DISCORD_TOKEN,   # User-Session oder Bot-Token – du hast User-Session
+    "User-Agent": "DiscordToAltrady/1.1"
 }
 
+# =========================
+# Helpers & Exceptions
+# =========================
+
+class SkipSignal(Exception):
+    """Gezielt überspringen (z. B. Non-USD-Quote)."""
+
 def parse_tp_splits(raw: str) -> tuple[int, int]:
-    """
-    Erwartet zwei Zahlen durch Komma getrennt. Summe muss 100 sein.
-    Fallback: (20, 80)
-    """
     try:
         parts = [p.strip() for p in raw.split(",")]
         if len(parts) != 2:
-            raise ValueError("Genau 2 Werte benötigt.")
-        a, b = int(float(parts[0])), int(float(parts[1]))  # erlaubt "20", "20.0"
-        if a <= 0 or b <= 0 or a > 100 or b > 100:
-            raise ValueError("Werte müssen 1..100 sein.")
-        if a + b != 100:
-            raise ValueError("Summe ungleich 100.")
+            raise ValueError
+        a, b = int(float(parts[0])), int(float(parts[1]))
+        if a <= 0 or b <= 0 or a > 100 or b > 100 or a + b != 100:
+            raise ValueError
         return a, b
     except Exception:
         print(f"[WARN] Ungültige TP_SPLITS='{raw}', verwende Fallback 20,80.")
@@ -120,9 +120,6 @@ def save_state(state: dict):
     tmp.replace(STATE_FILE)
 
 def sleep_until_next_tick():
-    """
-    Schläft exakt bis zum nächsten (n*POLL_BASE + POLL_OFFSET).
-    """
     now = time.time()
     period_start = (now // POLL_BASE) * POLL_BASE
     next_tick = period_start + POLL_BASE + POLL_OFFSET
@@ -155,9 +152,6 @@ def fetch_latest_message(channel_id: str):
 # =========================
 
 def extract_text_from_msg(msg: dict) -> str:
-    """
-    Erster BUY/SELL-Block (ignoriert Header/Timeframe, stoppt vor nächstem Block oder Leerzeile).
-    """
     def first_block_source() -> str:
         content = (msg.get("content") or "").strip()
         embeds = msg.get("embeds") or []
@@ -232,11 +226,15 @@ def parse_signal_text(text: str) -> dict:
     side = "long" if side_raw == "BUY" else "short"
 
     base = m_pair.group(1).upper()
-    quoted = m_pair.group(2).upper()
-    if quoted == "USD":
-        quoted = "USDT"
+    quoted_raw = m_pair.group(2).upper()  # wichtig für USD-Filter
+    if quoted_raw not in ("USD", "USDT"):
+        # bewusst überspringen (z. B. SOL/BTC)
+        raise SkipSignal(f"Non-USD Quote erkannt: {base}/{quoted_raw}")
 
-    # Mapping vor Caps (damit LUNA→LUNA2 greift)
+    # Normalisieren
+    quoted = "USDT" if quoted_raw == "USD" else "USDT"
+
+    # Mapping
     if base == "LUNA":
         base = "LUNA2"
     if base == "SHIB":
@@ -261,7 +259,7 @@ def parse_signal_text(text: str) -> dict:
     if lev > MAX_LEVERAGE:
         lev = MAX_LEVERAGE
 
-    # Coin-spezifischen Cap anwenden (z. B. LUNA2=50)
+    # Coin-spezifischer Cap
     coin_cap = COIN_LEV_CAPS.get(base)
     if coin_cap is not None and lev > coin_cap:
         lev = coin_cap
@@ -278,7 +276,7 @@ def parse_signal_text(text: str) -> dict:
     return {
         "side": side,
         "base": base,
-        "quote_from_signal": quoted,
+        "quote_from_signal": quoted,  # informativ
         "entry": entry,
         "tp1": tp1,
         "tp2": tp2,
@@ -293,9 +291,6 @@ def parse_signal_text(text: str) -> dict:
 # =========================
 
 def build_altrady_payload(parsed: dict) -> dict:
-    """
-    JSON exakt nach Wunsch, aber TP-Splits aus ENV (TP_SPLITS="x,y", Summe 100).
-    """
     return {
         "api_key": ALTRADY_API_KEY,
         "api_secret": ALTRADY_API_SECRET,
@@ -364,22 +359,31 @@ def main():
                     raw_text = extract_text_from_msg(msg)
                     if not raw_text:
                         print("[skip] leere/irrelevante Nachricht.")
+                        # trotzdem als verarbeitet markieren:
+                        last_id = mid; state["last_id"] = last_id; save_state(state)
                     else:
-                        dbg = re.sub(r"\s+", " ", raw_text)[:120]
+                        dbg = re.sub(r"\s+", " ", raw_text)[:140]
                         print(f"[DBG] Erster Block: {dbg!r}")
 
-                        parsed = parse_signal_text(raw_text)
-                        payload = build_altrady_payload(parsed)
-                        _ = post_to_altrady(payload)
+                        try:
+                            parsed = parse_signal_text(raw_text)
+                        except SkipSignal as sk:
+                            ts = datetime.now().strftime("%H:%M:%S")
+                            print(f"[{ts}] ⏭️ übersprungen: {sk}")
+                            # als verarbeitet markieren, damit nicht erneut geprüft wird
+                            last_id = mid; state["last_id"] = last_id; save_state(state)
+                        else:
+                            payload = build_altrady_payload(parsed)
+                            _ = post_to_altrady(payload)
 
-                        ts = datetime.now().strftime("%H:%M:%S")
-                        print(
-                            f"[{ts}] ✅ gesendet | {parsed['symbol']} | {parsed['side']} | "
-                            f"entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}"
-                        )
-                        last_id = mid
-                        state["last_id"] = last_id
-                        save_state(state)
+                            ts = datetime.now().strftime("%H:%M:%S")
+                            print(
+                                f"[{ts}] ✅ gesendet | {parsed['symbol']} | {parsed['side']} | "
+                                f"entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}"
+                            )
+                            last_id = mid
+                            state["last_id"] = last_id
+                            save_state(state)
                 else:
                     ts = datetime.now().strftime("%H:%M:%S")
                     print(f"[{ts}] Keine neuere Nachricht.")
@@ -399,9 +403,14 @@ def main():
             print("[HTTP ERROR]", http_err.response.status_code, body or "")
         except AssertionError as aex:
             print("[PARSE ERROR]", str(aex))
+            # Nachricht ist „verarbeitet“, damit wir nicht hängen bleiben:
+            if 'msg' in locals() and msg:
+                last_id = msg.get("id"); state["last_id"] = last_id; save_state(state)
         except Exception:
             print("[ERROR]")
             traceback.print_exc()
+            if 'msg' in locals() and msg:
+                last_id = msg.get("id"); state["last_id"] = last_id; save_state(state)
 
         sleep_until_next_tick()
 
