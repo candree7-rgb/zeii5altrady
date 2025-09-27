@@ -511,4 +511,46 @@ def main():
                 mid = msg.get("id")
                 if last_id is None or int(mid) > int(last_id):
                     blocks = extract_signal_blocks(msg)
-                    i
+                    if not blocks:
+                        print("[skip] keine erkennbaren Signal-Blöcke.")
+                        last_id = mid; state["last_id"]=last_id; save_state(state)
+                    else:
+                        print(f"[INFO] {len(blocks)} Signal-Block(s) gefunden.")
+                        for idx, raw_text in enumerate(blocks, start=1):
+                            dbg = re.sub(r"\s+"," ", raw_text)[:160]
+                            print(f"[DBG] Block {idx}: {dbg!r}")
+                            try:
+                                parsed = parse_signal_text(raw_text)
+                                enforce_leg_filter(parsed, msg)
+                            except SkipSignal as sk:
+                                print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏭️ Block {idx} übersprungen: {sk}")
+                                continue
+                            except AssertionError as aex:
+                                print(f"[PARSE ERROR] Block {idx}: {aex}"); continue
+                            except Exception:
+                                print(f"[ERROR] Block {idx} – unerwartet:"); traceback.print_exc(); continue
+                            else:
+                                ok = wait_for_touch_and_send(parsed)
+                                ts = datetime.now().strftime("%H:%M:%S")
+                                if ok:
+                                    print(f"[{ts}] ✅ Order platziert | {parsed['symbol']} | {parsed['side']} | entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}")
+                                else:
+                                    print(f"[{ts}] 🚫 Kein Entry – Touch nicht erfolgt.")
+                        last_id = mid; state["last_id"]=last_id; save_state(state)
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Keine neuere Nachricht.")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Kanal leer.")
+        except KeyboardInterrupt:
+            print("\nStopped."); break
+        except requests.HTTPError as http_err:
+            body = ""
+            try: body = http_err.response.text[:200]
+            except Exception: pass
+            print("[HTTP ERROR]", http_err.response.status_code, body or "")
+        except Exception:
+            print("[ERROR]"); traceback.print_exc()
+        sleep_until_next_tick()
+
+if __name__ == "__main__":
+    main()
