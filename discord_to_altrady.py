@@ -2,20 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Discord → Altrady Signal-Forwarder
-- Holt immer nur die NEUESTE Nachricht aus einem Discord-Channel
-- Extrahiert den ERSTEN Signal-Block (BUY/SELL) aus der Message
+Discord → Altrady Signal-Forwarder (Multi-Block + Leg-Filter)
+- Holt nur die NEUESTE Discord-Nachricht
+- Extrahiert ALLE Signal-Blöcke (BUY/SELL …), prüft jeden einzeln
 - Parst: BUY/SELL, on BASE/QUOTE, Price, TP1, TP2, SL
-- Mappings: LUNA→LUNA2, SHIB→1000SHIB, USD→USDT
+- Nur */USD bzw. */USDT (alles andere, z. B. */BTC, wird übersprungen)
+- Mappings: LUNA→LUNA2 (für Altrady), SHIB→1000SHIB, USD→USDT
 - Tick-Rundung (Tickmap)
-- Leverage: floor(SAFETY_PCT / SL%), gecappt mit MAX_LEVERAGE
-- Coin-spezifische Leverage-Caps (z. B. LUNA/LUNA2 = 50x)
-- **NEU**: Nur USD/USDT-Quotes werden gehandelt; alles andere (z. B. */BTC) wird sauber übersprungen.
-- Buildet das Altrady-JSON und postet direkt an deinen Altrady-Signal-Webhook
+- Leverage: floor(SAFETY_PCT / SL%), capped mit MAX_LEVERAGE + coin-spezifischen Caps (z. B. LUNA2=50)
+- TP-Splits aus ENV (TP_SPLITS="x,y", Summe 100)
+- Entry-Expiration aus ENV
+- **NEU**: Optionaler Leg-Filter via Binance-Klines + ZigZag → nur Leg 1–2 (und optional Trend-Match)
 
-Neu:
-- TP_SPLITS="20,80" aus ENV (genau 2 Werte, Summe 100; sonst Fallback 20/80)
-- Coin-Lev-Caps via ENV: z. B. LEV_MAX_LUNA2=50
+Benötigte zusätzliche ENVs (optional):
+- LEG_FILTER=on
+- LEG_TIMEFRAME_DEFAULT=M5
+- LEG_ZIGZAG_PCT=1.0
+- LEG_MAX_LOOKBACK=400
+- LEG_REQUIRE_TREND_MATCH=on
+- LEG_FAIL_MODE=skip   # oder open
 """
 
 import os
@@ -23,6 +28,7 @@ import re
 import sys
 import time
 import json
+import math
 import traceback
 from pathlib import Path
 from datetime import datetime
@@ -39,36 +45,37 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 
-# Altrady: direkter Signal-Webhook (von deinem Altrady Signal Bot)
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 
-# Altrady Auth + Ziel-Exchange/Quote
 ALTRADY_API_KEY    = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE   = os.getenv("ALTRADY_EXCHANGE", "BIFU").strip()   # z.B. BIFU, BYBIF
+ALTRADY_EXCHANGE   = os.getenv("ALTRADY_EXCHANGE", "BIFU").strip()
 QUOTE              = os.getenv("QUOTE", "USDT").strip().upper()
 
-# Dynamische Leverage-Berechnung
 MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "75"))
-SAFETY_PCT   = float(os.getenv("SAFETY_PCT", "80"))  # floor(SAFETY_PCT / SL%)
+SAFETY_PCT   = float(os.getenv("SAFETY_PCT", "80"))
 
-# Coin-spezifische Leverage-Caps (Defaults: LUNA/LUNA2 = 50x; per ENV überschreibbar)
 COIN_LEV_CAPS = {
     "LUNA2": int(os.getenv("LEV_MAX_LUNA2", "50")),
-    "LUNA":  int(os.getenv("LEV_MAX_LUNA",  "50")),
+    "LUNA":  int(os.getenv("LEV_MAX_LUNA",  "50")),  # falls mal vor Mapping geprüft wird
 }
 
-# TP-Splits (immer genau 2 TPs)
 TP_SPLITS_RAW = os.getenv("TP_SPLITS", "20,80").strip()
-
-# Entry-Expiration (Minuten)
 ENTRY_EXPIRATION_MIN = int(os.getenv("ENTRY_EXPIRATION_MIN", "15"))
 
-# Polling (alle X Sekunden, jeweils +Offset)
 POLL_BASE   = int(os.getenv("POLL_BASE_SECONDS", "60"))
 POLL_OFFSET = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
-
 STATE_FILE  = Path(os.getenv("STATE_FILE", "state.json"))
+
+# LEG-FILTER ENVs
+LEG_FILTER              = os.getenv("LEG_FILTER", "off").lower() == "on"
+LEG_TIMEFRAME_DEFAULT   = os.getenv("LEG_TIMEFRAME_DEFAULT", "M5").upper()
+LEG_ZIGZAG_PCT          = float(os.getenv("LEG_ZIGZAG_PCT", "1.0"))
+LEG_MAX_LOOKBACK        = int(os.getenv("LEG_MAX_LOOKBACK", "400"))
+LEG_REQUIRE_TREND_MATCH = os.getenv("LEG_REQUIRE_TREND_MATCH", "on").lower() == "on"
+LEG_FAIL_MODE           = os.getenv("LEG_FAIL_MODE", "skip").lower()  # "skip" oder "open"
+
+TF_MAP = {"M5": "5m", "M15": "15m", "H1": "1h", "1D": "1d"}
 
 # Sanity-Check
 if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
@@ -76,8 +83,8 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
     sys.exit(1)
 
 HEADERS = {
-    "Authorization": DISCORD_TOKEN,   # User-Session oder Bot-Token – du hast User-Session
-    "User-Agent": "DiscordToAltrady/1.1"
+    "Authorization": DISCORD_TOKEN,   # User-Session
+    "User-Agent": "DiscordToAltrady/1.3"
 }
 
 # =========================
@@ -85,7 +92,7 @@ HEADERS = {
 # =========================
 
 class SkipSignal(Exception):
-    """Gezielt überspringen (z. B. Non-USD-Quote)."""
+    """Gezielt überspringen (z. B. Non-USD-Quote, Leg > 2, RR/SL-Filter, etc.)."""
 
 def parse_tp_splits(raw: str) -> tuple[int, int]:
     try:
@@ -128,7 +135,7 @@ def sleep_until_next_tick():
     time.sleep(max(0, next_tick - now))
 
 # =========================
-# Discord: nur NEUESTE Nachricht holen
+# Discord: neueste Nachricht
 # =========================
 
 def fetch_latest_message(channel_id: str):
@@ -148,47 +155,85 @@ def fetch_latest_message(channel_id: str):
     return data[0] if data else None  # neueste zuerst
 
 # =========================
-# Text-Extraktion: nur ERSTEN Signal-Block
+# Text-Extraktion: ALLE Signal-Blöcke
 # =========================
 
-def extract_text_from_msg(msg: dict) -> str:
-    def first_block_source() -> str:
-        content = (msg.get("content") or "").strip()
+BUYSELL_LINE = re.compile(r"(?im)^\s*.*\b(BUY|SELL)\b.*$")
+
+def extract_signal_blocks(msg: dict) -> list[str]:
+    """
+    Liefert eine Liste aller BUY/SELL-Blöcke innerhalb der Nachricht.
+    - ignoriert Header wie '🎯 Trading Signals 🎯'
+    - trennt Blöcke an Zeilen, die BUY/SELL enthalten
+    - kappt jeden Block vor der nächsten BUY/SELL-Zeile oder vor Leerzeilen (2+ \n)
+    - entfernt Timeframe:-Zeilen
+    """
+    def source_text() -> str:
+        parts = []
+        content = (msg.get("content") or "").replace("\r", "")
+        parts.append(content)
         embeds = msg.get("embeds") or []
-        desc = ""
         if embeds and isinstance(embeds, list):
             e0 = embeds[0] or {}
-            desc = (e0.get("description") or "").strip()
-        base = desc if desc else content
-        return (base or "").replace("\r", "")
+            desc = (e0.get("description") or "").replace("\r", "")
+            if desc:
+                parts.append(desc)
+        return "\n".join([p for p in parts if p]).strip()
 
-    raw = first_block_source()
+    raw = source_text()
     if not raw:
-        return ""
+        return []
 
-    m_start = re.search(r"(?im)^\s*.*\b(BUY|SELL)\b.*$", raw)
-    if not m_start:
-        return ""
+    # Finde alle Zeilen, die BUY/SELL enthalten – das sind Block-Anfänge
+    starts = [m.start() for m in BUYSELL_LINE.finditer(raw)]
+    if not starts:
+        return []
 
-    start_idx = m_start.start()
-    tail = raw[start_idx:]
+    blocks = []
+    for i, s in enumerate(starts):
+        tail = raw[s:]
+        if i + 1 < len(starts):
+            # bis zum Beginn des nächsten Blocks
+            nxt = starts[i+1] - s
+            chunk = tail[:nxt]
+        else:
+            chunk = tail
 
-    m_next = re.search(r"(?im)^\s*.*\b(BUY|SELL)\b.*$", tail[len(m_start.group(0)) + 1:])
-    if m_next:
-        end_idx = len(m_start.group(0)) + 1 + m_next.start()
-        block = tail[:end_idx]
-    else:
-        block = tail
+        # kappen an erster Leerzeile (2+ \n)
+        m_blank = re.search(r"\n\s*\n", chunk)
+        if m_blank:
+            chunk = chunk[:m_blank.start()]
 
-    m_blank = re.search(r"\n\s*\n", block)
-    if m_blank:
-        block = block[:m_blank.start()]
+        # Timeframe-Zeilen entfernen
+        chunk = re.sub(r"(?im)^\s*Timeframe:.*$", "", chunk).strip()
 
-    block = re.sub(r"(?im)^\s*Timeframe:.*$", "", block).strip()
-    return block
+        # nur Blöcke behalten, die wirklich BUY/SELL enthalten
+        if BUYSELL_LINE.search(chunk):
+            blocks.append(chunk)
+
+    return blocks
+
+def find_timeframe_in_msg(msg: dict) -> str:
+    """Sucht 'Timeframe: XYZ' in content/embeds; Fallback ENV."""
+    parts = []
+    content = msg.get("content") or ""
+    parts.append(content)
+    embeds = msg.get("embeds") or []
+    if embeds and isinstance(embeds, list):
+        e0 = embeds[0] or {}
+        desc = e0.get("description") or ""
+        parts.append(desc)
+        f = e0.get("footer") or {}
+        ft = f.get("text") if isinstance(f, dict) else ""
+        if ft: parts.append(ft)
+    txt = "\n".join(parts)
+    m = re.search(r"Timeframe:\s*(M5|M15|H1|1D)", txt, re.I)
+    if m:
+        return m.group(1).upper()
+    return LEG_TIMEFRAME_DEFAULT
 
 # =========================
-# Parser (dein exaktes Format)
+# Parser (dein Format)
 # =========================
 
 TICK_MAP = {
@@ -226,15 +271,14 @@ def parse_signal_text(text: str) -> dict:
     side = "long" if side_raw == "BUY" else "short"
 
     base = m_pair.group(1).upper()
-    quoted_raw = m_pair.group(2).upper()  # wichtig für USD-Filter
+    quoted_raw = m_pair.group(2).upper()
     if quoted_raw not in ("USD", "USDT"):
-        # bewusst überspringen (z. B. SOL/BTC)
         raise SkipSignal(f"Non-USD Quote erkannt: {base}/{quoted_raw}")
 
-    # Normalisieren
-    quoted = "USDT" if quoted_raw == "USD" else "USDT"
+    # Normalisieren (wir handeln USDT)
+    quoted = "USDT"
 
-    # Mapping
+    # Mapping für Altrady
     if base == "LUNA":
         base = "LUNA2"
     if base == "SHIB":
@@ -276,7 +320,7 @@ def parse_signal_text(text: str) -> dict:
     return {
         "side": side,
         "base": base,
-        "quote_from_signal": quoted,  # informativ
+        "quote_from_signal": quoted,  # rein informativ
         "entry": entry,
         "tp1": tp1,
         "tp2": tp2,
@@ -285,6 +329,138 @@ def parse_signal_text(text: str) -> dict:
         "leverage": lev,
         "symbol": symbol
     }
+
+# =========================
+# Leg-Filter (Binance-Klines + ZigZag)
+# =========================
+
+def market_base_for_data(base: str) -> str:
+    """
+    Mapping für Marktdaten-Namen (Binance):
+    - Altrady 'LUNA2' entspricht auf Binance 'LUNA'
+    - '1000SHIB' ist auf Binance ebenfalls '1000SHIB'
+    - sonst 1:1
+    """
+    if base == "LUNA2":
+        return "LUNA"
+    return base
+
+def fetch_klines_binance_spot(base: str, quote: str, interval: str, limit: int):
+    sym = f"{base}{quote}"
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": sym, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    # Rückgabe: [(open, high, low, close), ...]
+    out = []
+    for k in data:
+        o,h,l,c = float(k[1]), float(k[2]), float(k[3]), float(k[4])
+        out.append((o,h,l,c))
+    return out
+
+def zigzag_pivots(closes: list[float], pct: float) -> list[int]:
+    """Einfacher ZigZag auf Close: liefert Pivot-Indizes. pct in % (z. B. 1.0)."""
+    if not closes:
+        return []
+    thr = pct / 100.0
+    piv = []
+    last_pivot_i = 0
+    last_pivot_val = closes[0]
+    direction = 0  # 1=up, -1=down, 0=unknown
+
+    for i in range(1, len(closes)):
+        up_change = (closes[i] - last_pivot_val) / last_pivot_val
+        down_change = (last_pivot_val - closes[i]) / last_pivot_val
+
+        if direction >= 0:
+            if up_change >= thr:
+                piv.append(last_pivot_i)
+                direction = 1
+                last_pivot_i = i
+                last_pivot_val = closes[i]
+            elif closes[i] < last_pivot_val:
+                last_pivot_i = i
+                last_pivot_val = closes[i]
+
+        if direction <= 0:
+            if down_change >= thr:
+                piv.append(last_pivot_i)
+                direction = -1
+                last_pivot_i = i
+                last_pivot_val = closes[i]
+            elif closes[i] > last_pivot_val:
+                last_pivot_i = i
+                last_pivot_val = closes[i]
+
+    if last_pivot_i not in piv:
+        piv.append(last_pivot_i)
+
+    piv = sorted(set(piv))
+    return piv
+
+def infer_trend_and_leg(closes: list[float], pivots: list[int]) -> tuple[str,int]:
+    """
+    Trend grob: vergleiche die letzten zwei Pivots (höher → up, tiefer → down).
+    Leg-Index grob: Anzahl Pivots seit einfachem Trendstart (1..5 clamp).
+    """
+    if len(pivots) < 3:
+        return "unknown", 1
+    recent = pivots[-10:]
+    last, prev = recent[-1], recent[-2]
+    trend = "up" if closes[last] > closes[prev] else "down"
+
+    # Trendstart heuristisch finden
+    start = recent[0]
+    for i in range(2, len(recent)):
+        a,b,c = recent[i-2], recent[i-1], recent[i]
+        if trend == "up":
+            if closes[a] < closes[b] and closes[c] > closes[b]:
+                start = b; break
+        else:
+            if closes[a] > closes[b] and closes[c] < closes[b]:
+                start = b; break
+
+    count = sum(1 for p in recent if p >= start)
+    leg_idx = max(1, min(5, count))
+    return trend, leg_idx
+
+def enforce_leg_filter(parsed: dict, msg: dict):
+    """Wirft SkipSignal, wenn Leg-Filter dagegen ist."""
+    if not LEG_FILTER:
+        return
+
+    tf = find_timeframe_in_msg(msg)  # M5/M15/H1/1D
+    interval = TF_MAP.get(tf, TF_MAP[LEG_TIMEFRAME_DEFAULT])
+
+    market_base = market_base_for_data(parsed["base"])
+    try:
+        kl = fetch_klines_binance_spot(market_base, "USDT", interval, min(LEG_MAX_LOOKBACK, 500))
+        closes = [c for (_,_,_,c) in kl]
+        piv = zigzag_pivots(closes, LEG_ZIGZAG_PCT)
+        trend, leg_idx = infer_trend_and_leg(closes, piv)
+
+        # optional: Trend muss zur Seite passen
+        if LEG_REQUIRE_TREND_MATCH and trend in ("up","down"):
+            if parsed["side"] == "long" and trend != "up":
+                raise SkipSignal(f"Trend-Mismatch: side=long, trend={trend}")
+            if parsed["side"] == "short" and trend != "down":
+                raise SkipSignal(f"Trend-Mismatch: side=short, trend={trend}")
+
+        # nur Leg 1–2 erlauben
+        if leg_idx > 2:
+            raise SkipSignal(f"Leg-Filter: aktueller Leg {leg_idx} > 2 ({trend})")
+
+        print(f"[LEG] tf={tf} interval={interval} trend={trend} leg={leg_idx} base={market_base}")
+
+    except SkipSignal:
+        raise
+    except Exception as ex:
+        msg_txt = f"Leg-Filter Fehler: {ex.__class__.__name__}: {ex}"
+        if LEG_FAIL_MODE == "skip":
+            raise SkipSignal(msg_txt)
+        else:
+            print(f"[LEG WARN] {msg_txt} → FAIL-OPEN (Signal wird trotzdem ausgeführt)")
 
 # =========================
 # Payload für Altrady
@@ -342,9 +518,10 @@ def post_to_altrady(payload: dict):
 def main():
     print(f"Getaktet: alle {POLL_BASE}s, jeweils +{POLL_OFFSET}s Offset")
     print(
-        "➡️ Exchange: {ex} | Quote: {q} | MaxLev: {gcap} | Safety%: {s} | TP%: {t1}/{t2} | Exp: {exp}m | CoinCaps: {caps}".format(
+        "➡️ Exchange: {ex} | Quote: {q} | MaxLev: {gcap} | Safety%: {s} | TP%: {t1}/{t2} | Exp: {exp}m | CoinCaps: {caps} | LegFilter: {lf}/{pct}%/{req}".format(
             ex=ALTRADY_EXCHANGE, q=QUOTE, gcap=MAX_LEVERAGE, s=SAFETY_PCT,
-            t1=TP1_PCT, t2=TP2_PCT, exp=ENTRY_EXPIRATION_MIN, caps=COIN_LEV_CAPS
+            t1=TP1_PCT, t2=TP2_PCT, exp=ENTRY_EXPIRATION_MIN, caps=COIN_LEV_CAPS,
+            lf=("ON" if LEG_FILTER else "OFF"), pct=LEG_ZIGZAG_PCT, req=("REQ" if LEG_REQUIRE_TREND_MATCH else "NO-REQ")
         )
     )
     state = load_state()
@@ -356,34 +533,44 @@ def main():
             if msg:
                 mid = msg.get("id")
                 if last_id is None or int(mid) > int(last_id):
-                    raw_text = extract_text_from_msg(msg)
-                    if not raw_text:
-                        print("[skip] leere/irrelevante Nachricht.")
-                        # trotzdem als verarbeitet markieren:
+                    blocks = extract_signal_blocks(msg)
+                    if not blocks:
+                        print("[skip] keine erkennbaren Signal-Blöcke.")
                         last_id = mid; state["last_id"] = last_id; save_state(state)
                     else:
-                        dbg = re.sub(r"\s+", " ", raw_text)[:140]
-                        print(f"[DBG] Erster Block: {dbg!r}")
+                        print(f"[INFO] {len(blocks)} Signal-Block(s) gefunden.")
+                        sent_any = False
+                        for idx, raw_text in enumerate(blocks, start=1):
+                            dbg = re.sub(r"\s+", " ", raw_text)[:140]
+                            print(f"[DBG] Block {idx}: {dbg!r}")
+                            try:
+                                parsed = parse_signal_text(raw_text)
+                                enforce_leg_filter(parsed, msg)  # optional aktiv je nach ENV
+                            except SkipSignal as sk:
+                                ts = datetime.now().strftime("%H:%M:%S")
+                                print(f"[{ts}] ⏭️ Block {idx} übersprungen: {sk}")
+                                continue
+                            except AssertionError as aex:
+                                print(f"[PARSE ERROR] Block {idx}: {aex}")
+                                continue
+                            except Exception:
+                                print(f"[ERROR] Block {idx} – unerwarteter Fehler:")
+                                traceback.print_exc()
+                                continue
+                            else:
+                                payload = build_altrady_payload(parsed)
+                                _ = post_to_altrady(payload)
+                                ts = datetime.now().strftime("%H:%M:%S")
+                                print(
+                                    f"[{ts}] ✅ gesendet (Block {idx}) | {parsed['symbol']} | {parsed['side']} | "
+                                    f"entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}"
+                                )
+                                sent_any = True
 
-                        try:
-                            parsed = parse_signal_text(raw_text)
-                        except SkipSignal as sk:
-                            ts = datetime.now().strftime("%H:%M:%S")
-                            print(f"[{ts}] ⏭️ übersprungen: {sk}")
-                            # als verarbeitet markieren, damit nicht erneut geprüft wird
-                            last_id = mid; state["last_id"] = last_id; save_state(state)
-                        else:
-                            payload = build_altrady_payload(parsed)
-                            _ = post_to_altrady(payload)
-
-                            ts = datetime.now().strftime("%H:%M:%S")
-                            print(
-                                f"[{ts}] ✅ gesendet | {parsed['symbol']} | {parsed['side']} | "
-                                f"entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}"
-                            )
-                            last_id = mid
-                            state["last_id"] = last_id
-                            save_state(state)
+                        # Nachricht als verarbeitet markieren (unabhängig davon, ob ein Block gesendet wurde)
+                        last_id = mid
+                        state["last_id"] = last_id
+                        save_state(state)
                 else:
                     ts = datetime.now().strftime("%H:%M:%S")
                     print(f"[{ts}] Keine neuere Nachricht.")
@@ -401,11 +588,6 @@ def main():
             except Exception:
                 pass
             print("[HTTP ERROR]", http_err.response.status_code, body or "")
-        except AssertionError as aex:
-            print("[PARSE ERROR]", str(aex))
-            # Nachricht ist „verarbeitet“, damit wir nicht hängen bleiben:
-            if 'msg' in locals() and msg:
-                last_id = msg.get("id"); state["last_id"] = last_id; save_state(state)
         except Exception:
             print("[ERROR]")
             traceback.print_exc()
