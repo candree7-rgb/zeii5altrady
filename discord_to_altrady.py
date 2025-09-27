@@ -2,25 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-Discord → Altrady Signal-Forwarder (Multi-Block + Leg-Filter)
-- Holt nur die NEUESTE Discord-Nachricht
-- Extrahiert ALLE Signal-Blöcke (BUY/SELL …), prüft jeden einzeln
+Discord → Altrady Signal-Forwarder (Multi-Block + Leg-Filter + Wait-for-Touch)
+- Extrahiert ALLE Signal-Blöcke (BUY/SELL …) aus der neuesten Discord-Message
 - Parst: BUY/SELL, on BASE/QUOTE, Price, TP1, TP2, SL
 - Nur */USD bzw. */USDT (alles andere, z. B. */BTC, wird übersprungen)
 - Mappings: LUNA→LUNA2 (für Altrady), SHIB→1000SHIB, USD→USDT
 - Tick-Rundung (Tickmap)
 - Leverage: floor(SAFETY_PCT / SL%), capped mit MAX_LEVERAGE + coin-spezifischen Caps (z. B. LUNA2=50)
 - TP-Splits aus ENV (TP_SPLITS="x,y", Summe 100)
-- Entry-Expiration aus ENV
-- **NEU**: Optionaler Leg-Filter via Binance-Klines + ZigZag → nur Leg 1–2 (und optional Trend-Match)
+- Entry-Expiration (Minuten) aus ENV
 
-Benötigte zusätzliche ENVs (optional):
-- LEG_FILTER=on
-- LEG_TIMEFRAME_DEFAULT=M5
-- LEG_ZIGZAG_PCT=1.0
-- LEG_MAX_LOOKBACK=400
-- LEG_REQUIRE_TREND_MATCH=on
-- LEG_FAIL_MODE=skip   # oder open
+NEU:
+- Optionaler Leg-Filter via Binance-Klines + ZigZag → nur Leg 1–2 (und optional Trend-Match)
+- Wait-for-Touch Guard:
+  * Wenn Preis auf „falscher Seite“ des Entry ist → warte bis Markt Entry berührt (±Toleranz)
+  * bei Touch: Standard MARKET-Order (oder via ENV Limit)
+  * Timeout nach ENTRY_WAIT_MAX_SEC
 """
 
 import os
@@ -73,9 +70,15 @@ LEG_TIMEFRAME_DEFAULT   = os.getenv("LEG_TIMEFRAME_DEFAULT", "M5").upper()
 LEG_ZIGZAG_PCT          = float(os.getenv("LEG_ZIGZAG_PCT", "1.0"))
 LEG_MAX_LOOKBACK        = int(os.getenv("LEG_MAX_LOOKBACK", "400"))
 LEG_REQUIRE_TREND_MATCH = os.getenv("LEG_REQUIRE_TREND_MATCH", "on").lower() == "on"
-LEG_FAIL_MODE           = os.getenv("LEG_FAIL_MODE", "skip").lower()  # "skip" oder "open"
+LEG_FAIL_MODE           = os.getenv("LEG_FAIL_MODE", "skip").lower()  # "skip" | "open"
 
 TF_MAP = {"M5": "5m", "M15": "15m", "H1": "1h", "1D": "1d"}
+
+# WAIT-FOR-TOUCH ENVs
+ENTRY_WAIT_MAX_SEC      = int(os.getenv("ENTRY_WAIT_MAX_SEC", "900"))   # 15 min
+ENTRY_POLL_SEC          = float(os.getenv("ENTRY_POLL_SEC", "3"))
+ENTRY_TOL_PCT           = float(os.getenv("ENTRY_TOL_PCT", "0.02"))     # % um Entry
+ENTRY_TOUCH_ORDER_TYPE  = os.getenv("ENTRY_TOUCH_ORDER_TYPE", "market").lower()  # "market" | "limit"
 
 # Sanity-Check
 if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
@@ -84,7 +87,7 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,   # User-Session
-    "User-Agent": "DiscordToAltrady/1.3"
+    "User-Agent": "DiscordToAltrady/1.4"
 }
 
 # =========================
@@ -92,7 +95,7 @@ HEADERS = {
 # =========================
 
 class SkipSignal(Exception):
-    """Gezielt überspringen (z. B. Non-USD-Quote, Leg > 2, RR/SL-Filter, etc.)."""
+    """Gezielt überspringen (z. B. Non-USD-Quote, Leg > 2, RR/SL-Filter, Timeout, etc.)."""
 
 def parse_tp_splits(raw: str) -> tuple[int, int]:
     try:
@@ -161,13 +164,6 @@ def fetch_latest_message(channel_id: str):
 BUYSELL_LINE = re.compile(r"(?im)^\s*.*\b(BUY|SELL)\b.*$")
 
 def extract_signal_blocks(msg: dict) -> list[str]:
-    """
-    Liefert eine Liste aller BUY/SELL-Blöcke innerhalb der Nachricht.
-    - ignoriert Header wie '🎯 Trading Signals 🎯'
-    - trennt Blöcke an Zeilen, die BUY/SELL enthalten
-    - kappt jeden Block vor der nächsten BUY/SELL-Zeile oder vor Leerzeilen (2+ \n)
-    - entfernt Timeframe:-Zeilen
-    """
     def source_text() -> str:
         parts = []
         content = (msg.get("content") or "").replace("\r", "")
@@ -184,7 +180,6 @@ def extract_signal_blocks(msg: dict) -> list[str]:
     if not raw:
         return []
 
-    # Finde alle Zeilen, die BUY/SELL enthalten – das sind Block-Anfänge
     starts = [m.start() for m in BUYSELL_LINE.finditer(raw)]
     if not starts:
         return []
@@ -193,28 +188,23 @@ def extract_signal_blocks(msg: dict) -> list[str]:
     for i, s in enumerate(starts):
         tail = raw[s:]
         if i + 1 < len(starts):
-            # bis zum Beginn des nächsten Blocks
             nxt = starts[i+1] - s
             chunk = tail[:nxt]
         else:
             chunk = tail
 
-        # kappen an erster Leerzeile (2+ \n)
         m_blank = re.search(r"\n\s*\n", chunk)
         if m_blank:
             chunk = chunk[:m_blank.start()]
 
-        # Timeframe-Zeilen entfernen
         chunk = re.sub(r"(?im)^\s*Timeframe:.*$", "", chunk).strip()
 
-        # nur Blöcke behalten, die wirklich BUY/SELL enthalten
         if BUYSELL_LINE.search(chunk):
             blocks.append(chunk)
 
     return blocks
 
 def find_timeframe_in_msg(msg: dict) -> str:
-    """Sucht 'Timeframe: XYZ' in content/embeds; Fallback ENV."""
     parts = []
     content = msg.get("content") or ""
     parts.append(content)
@@ -233,7 +223,7 @@ def find_timeframe_in_msg(msg: dict) -> str:
     return LEG_TIMEFRAME_DEFAULT
 
 # =========================
-# Parser (dein Format)
+# Parser
 # =========================
 
 TICK_MAP = {
@@ -275,10 +265,8 @@ def parse_signal_text(text: str) -> dict:
     if quoted_raw not in ("USD", "USDT"):
         raise SkipSignal(f"Non-USD Quote erkannt: {base}/{quoted_raw}")
 
-    # Normalisieren (wir handeln USDT)
     quoted = "USDT"
 
-    # Mapping für Altrady
     if base == "LUNA":
         base = "LUNA2"
     if base == "SHIB":
@@ -289,29 +277,21 @@ def parse_signal_text(text: str) -> dict:
     tp2   = float(m_tp2.group(1))
     sl    = float(m_sl.group(1))
 
-    # Plausibilität
     if side == "long" and not (sl < entry and tp1 > entry and tp2 > entry):
         raise ValueError("Long: TP/SL liegen nicht plausibel zum Entry.")
     if side == "short" and not (sl > entry and tp1 < entry and tp2 < entry):
         raise ValueError("Short: TP/SL liegen nicht plausibel zum Entry.")
 
-    # SL-% & dynamische Leverage
     sl_pct = ((entry - sl) / entry * 100.0) if side == "long" else ((sl - entry) / entry * 100.0)
     lev = int(SAFETY_PCT // max(sl_pct, 1e-12))
-    if lev < 1:
-        lev = 1
-    if lev > MAX_LEVERAGE:
-        lev = MAX_LEVERAGE
-
-    # Coin-spezifischer Cap
+    if lev < 1: lev = 1
+    if lev > MAX_LEVERAGE: lev = MAX_LEVERAGE
     coin_cap = COIN_LEV_CAPS.get(base)
     if coin_cap is not None and lev > coin_cap:
         lev = coin_cap
 
-    # Symbol-Format für Altrady: EXCHANGE_QUOTE_BASE
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
 
-    # Tick-Rundung
     entry = round_tick(base, entry)
     tp1   = round_tick(base, tp1)
     tp2   = round_tick(base, tp2)
@@ -320,7 +300,7 @@ def parse_signal_text(text: str) -> dict:
     return {
         "side": side,
         "base": base,
-        "quote_from_signal": quoted,  # rein informativ
+        "quote_from_signal": quoted,
         "entry": entry,
         "tp1": tp1,
         "tp2": tp2,
@@ -335,12 +315,6 @@ def parse_signal_text(text: str) -> dict:
 # =========================
 
 def market_base_for_data(base: str) -> str:
-    """
-    Mapping für Marktdaten-Namen (Binance):
-    - Altrady 'LUNA2' entspricht auf Binance 'LUNA'
-    - '1000SHIB' ist auf Binance ebenfalls '1000SHIB'
-    - sonst 1:1
-    """
     if base == "LUNA2":
         return "LUNA"
     return base
@@ -352,7 +326,6 @@ def fetch_klines_binance_spot(base: str, quote: str, interval: str, limit: int):
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
     data = r.json()
-    # Rückgabe: [(open, high, low, close), ...]
     out = []
     for k in data:
         o,h,l,c = float(k[1]), float(k[2]), float(k[3]), float(k[4])
@@ -360,9 +333,7 @@ def fetch_klines_binance_spot(base: str, quote: str, interval: str, limit: int):
     return out
 
 def zigzag_pivots(closes: list[float], pct: float) -> list[int]:
-    """Einfacher ZigZag auf Close: liefert Pivot-Indizes. pct in % (z. B. 1.0)."""
-    if not closes:
-        return []
+    if not closes: return []
     thr = pct / 100.0
     piv = []
     last_pivot_i = 0
@@ -370,47 +341,33 @@ def zigzag_pivots(closes: list[float], pct: float) -> list[int]:
     direction = 0  # 1=up, -1=down, 0=unknown
 
     for i in range(1, len(closes)):
-        up_change = (closes[i] - last_pivot_val) / last_pivot_val
+        up_change   = (closes[i] - last_pivot_val) / last_pivot_val
         down_change = (last_pivot_val - closes[i]) / last_pivot_val
 
         if direction >= 0:
             if up_change >= thr:
-                piv.append(last_pivot_i)
-                direction = 1
-                last_pivot_i = i
-                last_pivot_val = closes[i]
+                piv.append(last_pivot_i); direction = 1
+                last_pivot_i = i; last_pivot_val = closes[i]
             elif closes[i] < last_pivot_val:
-                last_pivot_i = i
-                last_pivot_val = closes[i]
+                last_pivot_i = i; last_pivot_val = closes[i]
 
         if direction <= 0:
             if down_change >= thr:
-                piv.append(last_pivot_i)
-                direction = -1
-                last_pivot_i = i
-                last_pivot_val = closes[i]
+                piv.append(last_pivot_i); direction = -1
+                last_pivot_i = i; last_pivot_val = closes[i]
             elif closes[i] > last_pivot_val:
-                last_pivot_i = i
-                last_pivot_val = closes[i]
+                last_pivot_i = i; last_pivot_val = closes[i]
 
     if last_pivot_i not in piv:
         piv.append(last_pivot_i)
-
-    piv = sorted(set(piv))
-    return piv
+    return sorted(set(piv))
 
 def infer_trend_and_leg(closes: list[float], pivots: list[int]) -> tuple[str,int]:
-    """
-    Trend grob: vergleiche die letzten zwei Pivots (höher → up, tiefer → down).
-    Leg-Index grob: Anzahl Pivots seit einfachem Trendstart (1..5 clamp).
-    """
     if len(pivots) < 3:
         return "unknown", 1
     recent = pivots[-10:]
     last, prev = recent[-1], recent[-2]
     trend = "up" if closes[last] > closes[prev] else "down"
-
-    # Trendstart heuristisch finden
     start = recent[0]
     for i in range(2, len(recent)):
         a,b,c = recent[i-2], recent[i-1], recent[i]
@@ -420,39 +377,29 @@ def infer_trend_and_leg(closes: list[float], pivots: list[int]) -> tuple[str,int
         else:
             if closes[a] > closes[b] and closes[c] < closes[b]:
                 start = b; break
-
     count = sum(1 for p in recent if p >= start)
     leg_idx = max(1, min(5, count))
     return trend, leg_idx
 
 def enforce_leg_filter(parsed: dict, msg: dict):
-    """Wirft SkipSignal, wenn Leg-Filter dagegen ist."""
     if not LEG_FILTER:
         return
-
     tf = find_timeframe_in_msg(msg)  # M5/M15/H1/1D
     interval = TF_MAP.get(tf, TF_MAP[LEG_TIMEFRAME_DEFAULT])
-
     market_base = market_base_for_data(parsed["base"])
     try:
         kl = fetch_klines_binance_spot(market_base, "USDT", interval, min(LEG_MAX_LOOKBACK, 500))
         closes = [c for (_,_,_,c) in kl]
         piv = zigzag_pivots(closes, LEG_ZIGZAG_PCT)
         trend, leg_idx = infer_trend_and_leg(closes, piv)
-
-        # optional: Trend muss zur Seite passen
         if LEG_REQUIRE_TREND_MATCH and trend in ("up","down"):
             if parsed["side"] == "long" and trend != "up":
                 raise SkipSignal(f"Trend-Mismatch: side=long, trend={trend}")
             if parsed["side"] == "short" and trend != "down":
                 raise SkipSignal(f"Trend-Mismatch: side=short, trend={trend}")
-
-        # nur Leg 1–2 erlauben
         if leg_idx > 2:
             raise SkipSignal(f"Leg-Filter: aktueller Leg {leg_idx} > 2 ({trend})")
-
         print(f"[LEG] tf={tf} interval={interval} trend={trend} leg={leg_idx} base={market_base}")
-
     except SkipSignal:
         raise
     except Exception as ex:
@@ -463,19 +410,33 @@ def enforce_leg_filter(parsed: dict, msg: dict):
             print(f"[LEG WARN] {msg_txt} → FAIL-OPEN (Signal wird trotzdem ausgeführt)")
 
 # =========================
+# Binance Price Helpers (für Wait-for-Touch)
+# =========================
+
+def binance_symbol_for_price(base: str) -> str:
+    b = market_base_for_data(base)
+    return f"{b}USDT"
+
+def fetch_last_price_binance(base: str) -> float:
+    sym = binance_symbol_for_price(base)
+    url = "https://api.binance.com/api/v3/ticker/price"
+    r = requests.get(url, params={"symbol": sym}, timeout=8)
+    r.raise_for_status()
+    return float(r.json()["price"])
+
+# =========================
 # Payload für Altrady
 # =========================
 
-def build_altrady_payload(parsed: dict) -> dict:
-    return {
+def build_altrady_payload(parsed: dict, order_type: str = "limit") -> dict:
+    payload = {
         "api_key": ALTRADY_API_KEY,
         "api_secret": ALTRADY_API_SECRET,
         "exchange": ALTRADY_EXCHANGE,
         "action": "open",
         "symbol": parsed["symbol"],
         "side": parsed["side"],
-        "order_type": "limit",
-        "signal_price": parsed["entry"],
+        "order_type": order_type,
         "leverage": parsed["leverage"],
         "take_profit": [
             {"price": parsed["tp1"], "position_percentage": TP1_PCT},
@@ -487,6 +448,84 @@ def build_altrady_payload(parsed: dict) -> dict:
         },
         "entry_expiration": {"time": ENTRY_EXPIRATION_MIN}
     }
+    # Nur bei Limit darf/muss signal_price mit:
+    if order_type == "limit":
+        payload["signal_price"] = parsed["entry"]
+    return payload
+
+# =========================
+# Wait-for-Touch Guard
+# =========================
+
+def should_wait_for_touch(side: str, last: float, entry: float, tol_abs: float) -> bool:
+    """
+    Long: wenn Markt deutlich UNTER Entry ist → warten
+    Short: wenn Markt deutlich ÜBER Entry ist → warten
+    """
+    if side == "long":
+        return last < (entry - tol_abs)
+    else:
+        return last > (entry + tol_abs)
+
+def wait_for_touch_and_send(parsed: dict) -> bool:
+    """
+    Wartet bis der Markt den Entry „berührt“ (±Toleranz) – max ENTRY_WAIT_MAX_SEC.
+    - Wenn Warten NICHT nötig: sendet sofort Limit-Order @ Entry
+    - Wenn Warten nötig und Touch erfolgt: sendet Order (Default MARKET, per ENV konfigurierbar)
+    - Bei Timeout: False (skip)
+    """
+    entry = parsed["entry"]
+    side  = parsed["side"]
+    base  = parsed["base"]
+
+    tol_abs = entry * (ENTRY_TOL_PCT / 100.0)
+
+    try:
+        last = fetch_last_price_binance(base)
+    except Exception as ex:
+        print(f"[TOUCH] Preisabfrage-Fehler ({base}): {ex} → FAIL-OPEN mit Limit")
+        # wenn Preis nicht abrufbar, lieber „safe“ sofort Limit @ Entry senden:
+        payload = build_altrady_payload(parsed, order_type="limit")
+        post_to_altrady(payload)
+        return True
+
+    # Entscheiden, ob wir warten müssen
+    if not should_wait_for_touch(side, last, entry, tol_abs):
+        # Sofort: Limit @ Entry (klassisch, liegt Preis auf „richtiger“ Seite)
+        print(f"[TOUCH] Kein Warten nötig ({base}) last={last} entry={entry}")
+        payload = build_altrady_payload(parsed, order_type="limit")
+        post_to_altrady(payload)
+        return True
+
+    # Warten bis Touch
+    print(f"[TOUCH] Warten auf Entry-Touch ({base}) last={last} entry={entry} tol={tol_abs:.8f} ...")
+    t0 = time.time()
+    while time.time() - t0 <= ENTRY_WAIT_MAX_SEC:
+        time.sleep(max(0.5, ENTRY_POLL_SEC))
+        try:
+            last = fetch_last_price_binance(base)
+        except Exception as ex:
+            print(f"[TOUCH] Preis-Error ({base}): {ex}")
+            continue
+
+        if side == "long":
+            if last >= (entry - tol_abs):
+                print(f"[TOUCH] LONG-Touch erkannt ({base}) last={last} ~ entry={entry}")
+                order_type = ENTRY_TOUCH_ORDER_TYPE if ENTRY_TOUCH_ORDER_TYPE in ("market","limit") else "market"
+                payload = build_altrady_payload(parsed, order_type=order_type)
+                post_to_altrady(payload)
+                return True
+        else:  # short
+            if last <= (entry + tol_abs):
+                print(f"[TOUCH] SHORT-Touch erkannt ({base}) last={last} ~ entry={entry}")
+                order_type = ENTRY_TOUCH_ORDER_TYPE if ENTRY_TOUCH_ORDER_TYPE in ("market","limit") else "market"
+                payload = build_altrady_payload(parsed, order_type=order_type)
+                post_to_altrady(payload)
+                return True
+
+    # Timeout
+    print(f"[TOUCH] Timeout ({base}) – Entry nicht erreicht. Trade verworfen.")
+    return False
 
 # =========================
 # Senden an Altrady Webhook
@@ -518,10 +557,12 @@ def post_to_altrady(payload: dict):
 def main():
     print(f"Getaktet: alle {POLL_BASE}s, jeweils +{POLL_OFFSET}s Offset")
     print(
-        "➡️ Exchange: {ex} | Quote: {q} | MaxLev: {gcap} | Safety%: {s} | TP%: {t1}/{t2} | Exp: {exp}m | CoinCaps: {caps} | LegFilter: {lf}/{pct}%/{req}".format(
+        "➡️ Exchange: {ex} | Quote: {q} | MaxLev: {gcap} | Safety%: {s} | TP%: {t1}/{t2} | Exp: {exp}m "
+        "| CoinCaps: {caps} | LegFilter: {lf}/{pct}%/{req} | Touch: {wait}s/{poll}s/{tol}%/{otype}".format(
             ex=ALTRADY_EXCHANGE, q=QUOTE, gcap=MAX_LEVERAGE, s=SAFETY_PCT,
             t1=TP1_PCT, t2=TP2_PCT, exp=ENTRY_EXPIRATION_MIN, caps=COIN_LEV_CAPS,
-            lf=("ON" if LEG_FILTER else "OFF"), pct=LEG_ZIGZAG_PCT, req=("REQ" if LEG_REQUIRE_TREND_MATCH else "NO-REQ")
+            lf=("ON" if LEG_FILTER else "OFF"), pct=LEG_ZIGZAG_PCT, req=("REQ" if LEG_REQUIRE_TREND_MATCH else "NO-REQ"),
+            wait=ENTRY_WAIT_MAX_SEC, poll=ENTRY_POLL_SEC, tol=ENTRY_TOL_PCT, otype=ENTRY_TOUCH_ORDER_TYPE.upper()
         )
     )
     state = load_state()
@@ -539,7 +580,6 @@ def main():
                         last_id = mid; state["last_id"] = last_id; save_state(state)
                     else:
                         print(f"[INFO] {len(blocks)} Signal-Block(s) gefunden.")
-                        sent_any = False
                         for idx, raw_text in enumerate(blocks, start=1):
                             dbg = re.sub(r"\s+", " ", raw_text)[:140]
                             print(f"[DBG] Block {idx}: {dbg!r}")
@@ -558,16 +598,15 @@ def main():
                                 traceback.print_exc()
                                 continue
                             else:
-                                payload = build_altrady_payload(parsed)
-                                _ = post_to_altrady(payload)
+                                # >>> Wait-for-Touch Guard <<<
+                                ok = wait_for_touch_and_send(parsed)
                                 ts = datetime.now().strftime("%H:%M:%S")
-                                print(
-                                    f"[{ts}] ✅ gesendet (Block {idx}) | {parsed['symbol']} | {parsed['side']} | "
-                                    f"entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}"
-                                )
-                                sent_any = True
+                                if ok:
+                                    print(f"[{ts}] ✅ Order platziert (Block {idx}) | {parsed['symbol']} | {parsed['side']} | entry={parsed['entry']} | lev={parsed['leverage']} | TP%={TP1_PCT}/{TP2_PCT}")
+                                else:
+                                    print(f"[{ts}] 🚫 Kein Entry (Block {idx}) – Touch nicht erfolgt.")
 
-                        # Nachricht als verarbeitet markieren (unabhängig davon, ob ein Block gesendet wurde)
+                        # Nachricht als verarbeitet markieren
                         last_id = mid
                         state["last_id"] = last_id
                         save_state(state)
