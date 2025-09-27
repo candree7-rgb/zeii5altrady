@@ -65,12 +65,14 @@ POLL_OFFSET = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
 STATE_FILE  = Path(os.getenv("STATE_FILE", "state.json"))
 
 # LEG-FILTER ENVs
-LEG_FILTER              = os.getenv("LEG_FILTER", "off").lower() == "on"
-LEG_TIMEFRAME_DEFAULT   = os.getenv("LEG_TIMEFRAME_DEFAULT", "M5").upper()
-LEG_ZIGZAG_PCT          = float(os.getenv("LEG_ZIGZAG_PCT", "1.0"))
-LEG_MAX_LOOKBACK        = int(os.getenv("LEG_MAX_LOOKBACK", "400"))
-LEG_REQUIRE_TREND_MATCH = os.getenv("LEG_REQUIRE_TREND_MATCH", "on").lower() == "on"
-LEG_FAIL_MODE           = os.getenv("LEG_FAIL_MODE", "skip").lower()  # "skip" | "open"
+LEG_FILTER               = os.getenv("LEG_FILTER", "off").lower() == "on"
+LEG_TIMEFRAME_DEFAULT    = os.getenv("LEG_TIMEFRAME_DEFAULT", "M5").upper()
+LEG_ZIGZAG_PCT           = float(os.getenv("LEG_ZIGZAG_PCT", "1.0"))
+LEG_MAX                  = int(os.getenv("LEG_MAX", "3"))   # nur Legs <= LEG_MAX erlaubt
+LEG_MAX_LOOKBACK         = int(os.getenv("LEG_MAX_LOOKBACK", "400"))
+LEG_REQUIRE_TREND_MATCH  = os.getenv("LEG_REQUIRE_TREND_MATCH", "on").lower() == "on"
+LEG_FAIL_MODE            = os.getenv("LEG_FAIL_MODE", "skip").lower()  # "skip" | "open"
+
 
 TF_MAP = {"M5": "5m", "M15": "15m", "H1": "1h", "1D": "1d"}
 
@@ -328,12 +330,13 @@ def fetch_klines_binance_spot(base: str, quote: str, interval: str, limit: int):
     data = r.json()
     out = []
     for k in data:
-        o,h,l,c = float(k[1]), float(k[2]), float(k[3]), float(k[4])
-        out.append((o,h,l,c))
+        o, h, l, c = float(k[1]), float(k[2]), float(k[3]), float(k[4])
+        out.append((o, h, l, c))
     return out
 
 def zigzag_pivots(closes: list[float], pct: float) -> list[int]:
-    if not closes: return []
+    if not closes:
+        return []
     thr = pct / 100.0
     piv = []
     last_pivot_i = 0
@@ -346,37 +349,48 @@ def zigzag_pivots(closes: list[float], pct: float) -> list[int]:
 
         if direction >= 0:
             if up_change >= thr:
-                piv.append(last_pivot_i); direction = 1
-                last_pivot_i = i; last_pivot_val = closes[i]
+                piv.append(last_pivot_i)
+                direction = 1
+                last_pivot_i = i
+                last_pivot_val = closes[i]
             elif closes[i] < last_pivot_val:
-                last_pivot_i = i; last_pivot_val = closes[i]
+                last_pivot_i = i
+                last_pivot_val = closes[i]
 
         if direction <= 0:
             if down_change >= thr:
-                piv.append(last_pivot_i); direction = -1
-                last_pivot_i = i; last_pivot_val = closes[i]
+                piv.append(last_pivot_i)
+                direction = -1
+                last_pivot_i = i
+                last_pivot_val = closes[i]
             elif closes[i] > last_pivot_val:
-                last_pivot_i = i; last_pivot_val = closes[i]
+                last_pivot_i = i
+                last_pivot_val = closes[i]
 
     if last_pivot_i not in piv:
         piv.append(last_pivot_i)
     return sorted(set(piv))
 
-def infer_trend_and_leg(closes: list[float], pivots: list[int]) -> tuple[str,int]:
+def infer_trend_and_leg(closes: list[float], pivots: list[int]) -> tuple[str, int]:
     if len(pivots) < 3:
         return "unknown", 1
     recent = pivots[-10:]
-    last, prev = recent[-1], recent[-2]
-    trend = "up" if closes[last] > closes[prev] else "down"
+    last_i, prev_i = recent[-1], recent[-2]
+    trend = "up" if closes[last_i] > closes[prev_i] else "down"
+
+    # einfachen Trendstart heuristisch bestimmen
     start = recent[0]
     for i in range(2, len(recent)):
-        a,b,c = recent[i-2], recent[i-1], recent[i]
+        a, b, c = recent[i-2], recent[i-1], recent[i]
         if trend == "up":
             if closes[a] < closes[b] and closes[c] > closes[b]:
-                start = b; break
+                start = b
+                break
         else:
             if closes[a] > closes[b] and closes[c] < closes[b]:
-                start = b; break
+                start = b
+                break
+
     count = sum(1 for p in recent if p >= start)
     leg_idx = max(1, min(5, count))
     return trend, leg_idx
@@ -384,22 +398,30 @@ def infer_trend_and_leg(closes: list[float], pivots: list[int]) -> tuple[str,int
 def enforce_leg_filter(parsed: dict, msg: dict):
     if not LEG_FILTER:
         return
+
     tf = find_timeframe_in_msg(msg)  # M5/M15/H1/1D
     interval = TF_MAP.get(tf, TF_MAP[LEG_TIMEFRAME_DEFAULT])
     market_base = market_base_for_data(parsed["base"])
+
     try:
         kl = fetch_klines_binance_spot(market_base, "USDT", interval, min(LEG_MAX_LOOKBACK, 500))
-        closes = [c for (_,_,_,c) in kl]
+        closes = [c for (_, _, _, c) in kl]
         piv = zigzag_pivots(closes, LEG_ZIGZAG_PCT)
         trend, leg_idx = infer_trend_and_leg(closes, piv)
-        if LEG_REQUIRE_TREND_MATCH and trend in ("up","down"):
+
+        # Trend muss (optional) zur Orderrichtung passen
+        if LEG_REQUIRE_TREND_MATCH and trend in ("up", "down"):
             if parsed["side"] == "long" and trend != "up":
                 raise SkipSignal(f"Trend-Mismatch: side=long, trend={trend}")
             if parsed["side"] == "short" and trend != "down":
                 raise SkipSignal(f"Trend-Mismatch: side=short, trend={trend}")
-        if leg_idx > 2:
-            raise SkipSignal(f"Leg-Filter: aktueller Leg {leg_idx} > 2 ({trend})")
-        print(f"[LEG] tf={tf} interval={interval} trend={trend} leg={leg_idx} base={market_base}")
+
+        # nur Leg 1–LEG_MAX erlauben
+        if leg_idx > LEG_MAX:
+            raise SkipSignal(f"Leg-Filter: aktueller Leg {leg_idx} > {LEG_MAX} ({trend})")
+
+        print(f"[LEG] tf={tf} interval={interval} trend={trend} leg={leg_idx} (max {LEG_MAX}) base={market_base}")
+
     except SkipSignal:
         raise
     except Exception as ex:
@@ -408,6 +430,7 @@ def enforce_leg_filter(parsed: dict, msg: dict):
             raise SkipSignal(msg_txt)
         else:
             print(f"[LEG WARN] {msg_txt} → FAIL-OPEN (Signal wird trotzdem ausgeführt)")
+
 
 # =========================
 # Binance Price Helpers (für Wait-for-Touch)
